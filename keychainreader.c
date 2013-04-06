@@ -1,8 +1,8 @@
 // Build instructions:
-// $ gcc keychaindump.c -o keychaindump -lcrypto
+// $ gcc keychainreader.c -o keychainreader -lcrypto
 
 // Usage:
-// $ ./keychaindump <path to keychain file>
+// $ ./keychainreader <path to keychain file>
 
 #include <stdio.h>
 #include <stdlib.h>

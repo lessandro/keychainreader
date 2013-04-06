@@ -1,4 +1,4 @@
-# keychaindump
+# keychainreader
 
 This program is a modification of Juuso Salonen's [keychaindump](https://github.com/juuso/keychaindump). The difference is, instead of looking for the master key in memory, you simply pass the keychain password to the program.
 
@@ -7,11 +7,11 @@ This is a simple OSX keychain reader.
 ## How?
 Build instructions:
 
-    $ gcc keychaindump.c -o keychaindump -lcrypto
+    $ gcc keychainreader.c -o keychainreader -lcrypto
 
 Basic usage:
 
-    $ ./keychaindump <path to keychain file>
+    $ ./keychainreader <path to keychain file>
 
     [*] Enter password (will be echoed!):
 

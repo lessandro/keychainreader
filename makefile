@@ -1,2 +1,2 @@
 all:
-	gcc keychaindump.c -o keychaindump -lcrypto
+	gcc keychainreader.c -o keychainreader -lcrypto
