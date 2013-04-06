@@ -19,7 +19,10 @@ typedef struct t_credentials {
     size_t ciphertext_len;
     char *ciphertext;
     char *server;
+    char *name;
     char *account;
+    char *where;
+    char *comments;
     char *password;
 } t_credentials;
 
@@ -178,6 +181,22 @@ void dump_key_blob(char *key, char *blob) {
     memcpy(cred->key, tmp + 4, 24);
 }
 
+// Reads a string attribute from a record
+char* read_attribute(char *record, int attr_num) {
+    int attribute_offset = atom32(record + 24 + attr_num*4) & 0xfffffffe;
+    char *attribute = record + attribute_offset;
+    int len = atom32(attribute + 0);
+
+    // Attributes with ridiculous lengths probably aren't strings
+    if (!len || len > 1024) return 0;
+
+    char *attr_str = malloc(len + 1);
+    memset(attr_str, 0, len + 1);
+    memcpy(attr_str, attribute + 4, len);
+
+    return attr_str;
+}
+
 // Extracts the encrypted password and the srvr & acct attributes from
 // the (probably table 8) record into the global credentials list.
 void dump_credentials_data(char *record) {
@@ -190,9 +209,8 @@ void dump_credentials_data(char *record) {
     int first_attribute_offset = atom32(record + 24) & 0xfffffffe;
     int data_offset = first_attribute_offset - data_sz;
     int attribute_count = (data_offset - 24) / 4;
-    
     // The correct table (8) has 20 attributes
-    if (attribute_count != 20) return;
+    if (attribute_count < 16) return;
     
     char *data = record + data_offset;
     
@@ -212,26 +230,12 @@ void dump_credentials_data(char *record) {
     memcpy(cred->iv, iv, 8);
     cred->ciphertext = ciphertext;
     cred->ciphertext_len = ciphertext_len;
-    
-    // Attributes 13 and 15
-    int srvr_attribute_offset = atom32(record + 24 + 15*4) & 0xfffffffe;
-    int acct_attribute_offset = atom32(record + 24 + 13*4) & 0xfffffffe;
-    char *srvr_attribute = record + srvr_attribute_offset;
-    char *acct_attribute = record + acct_attribute_offset;
-    int srvr_len = atom32(srvr_attribute + 0);
-    int acct_len = atom32(acct_attribute + 0);
-    
-    if (!srvr_len || !acct_len) return;
-    
-    char *srvr = malloc(srvr_len + 1);
-    char *acct = malloc(acct_len + 1);
-    memset(srvr, 0, srvr_len + 1);
-    memset(acct, 0, acct_len + 1);
-    memcpy(srvr, srvr_attribute + 4, srvr_len);
-    memcpy(acct, acct_attribute + 4, acct_len);
-    
-    cred->server = srvr;
-    cred->account = acct;
+
+    cred->server = read_attribute(record, 15);
+    cred->name = read_attribute(record, 7);
+    cred->account = read_attribute(record, 13);
+    cred->where = read_attribute(record, 14);
+    cred->comments = read_attribute(record, 3);
 }
 
 // Parses the keychain file (Apple Database) and traverses each record
@@ -317,7 +321,14 @@ void print_credentials() {
         t_credentials *cred = &g_credentials[i];
         if (!cred->account && !cred->server) continue;
         if (!strcmp(cred->account, "Passwords not saved")) continue;
-        printf("%s:%s:%s\n", cred->account, cred->server, cred->password);
+
+        printf("name: %s\n", cred->name);
+        printf("account: %s\n", cred->account);
+        printf("where: %s\n", cred->where);
+        printf("password: %s\n", cred->password);
+        printf("comments: %s\n", cred->comments);
+        printf("server: %s\n", cred->server);
+        puts("");
     }
 }
 
